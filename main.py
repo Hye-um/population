@@ -379,4 +379,3 @@ st.caption(
     f"데이터 출처: "
     f"[GitHub CSV 원본]({DATA_URL}) · 기준 연도: {latest_year}년"
 )
-```
