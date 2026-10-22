@@ -1,487 +1,309 @@
 
-import streamlit as st
+import json
+import re
+
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
+import requests
+import streamlit as st
+
 
 # --------------------------------------------------
-# 1. 페이지 기본 설정
+# 기본 설정
 # --------------------------------------------------
 st.set_page_config(
-    page_title="동네별 인구 피라미드",
-    page_icon="🏡",
+    page_title="전국 고령화 단계구분도",
+    page_icon="🗺️",
     layout="wide",
 )
 
-# 따뜻한 색감의 화면 디자인
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background-color: #FFF9F2;
-    }
-    h1, h2, h3 {
-        color: #754C38;
-    }
-    div[data-testid="stMetric"] {
-        background-color: #FFFFFF;
-        border: 1px solid #F0D9C5;
-        border-radius: 12px;
-        padding: 15px;
-    }
-    div[data-testid="stSelectbox"] label {
-        color: #754C38;
-        font-weight: bold;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.title("🗺️ 전국 고령화 단계구분도")
+st.caption("2026년 6월 기준 · 전국 시군구별 65세 이상 인구 비율")
+
+POPULATION_URL = (
+    "https://raw.githubusercontent.com/"
+    "Hye-um/population/main/population_ts_yearly_gender.zip"
 )
 
-# --------------------------------------------------
-# 2. 데이터 불러오기
-# --------------------------------------------------
-DATA_URL = (
-    "https://raw.githubusercontent.com/first2022-cyber/"
-    "contents/main/population_ts_yearly_gender.zip"
+GEOJSON_URL = (
+    "https://raw.githubusercontent.com/"
+    "first2022-cyber/contents//main/sigungu_kr.geojson"
 )
 
 
-@st.cache_data(show_spinner="전국 인구 데이터를 불러오는 중입니다...")
+# --------------------------------------------------
+# 데이터 불러오기
+# --------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner="인구 데이터와 지도를 불러오는 중...")
 def load_data():
-    # pandas가 ZIP 압축 파일을 직접 읽습니다.
-    df = pd.read_csv(DATA_URL, compression="zip")
+    # ZIP 주소를 pandas가 직접 읽음
+    response = requests.get(POPULATION_URL, timeout=120)
+    response.raise_for_status()
+
+    from io import BytesIO
+
+    df = pd.read_csv(BytesIO(response.content), compression="zip")
 
     # 열 이름의 앞뒤 공백 제거
     df.columns = df.columns.astype(str).str.strip()
 
-    # 연도 변환
+    # 연도는 숫자로 변환
     df["연도"] = pd.to_numeric(df["연도"], errors="coerce")
-    df = df.dropna(subset=["연도"]).copy()
-    df["연도"] = df["연도"].astype(int)
 
-    # 지역 이름을 문자열로 통일
-    for col in ["시도", "시군구", "동"]:
-        df[col] = df[col].fillna("").astype(str).str.strip()
+    # 2026년 자료만 사용
+    df = df[df["연도"] == 2026].copy()
 
-    # 나이 라벨: 0세부터 100세 이상까지
-    ages = [f"{age}세" for age in range(101)]
-    ages[-1] = "100세 이상"
+    if df.empty:
+        raise ValueError("인구 데이터에서 2026년 자료를 찾을 수 없습니다.")
 
-    # 남녀 나이별 인구 열을 숫자로 변환
-    for age in ages:
-        for gender in ["남", "여"]:
-            col = f"{gender}_{age}"
+    # 코드는 숫자로 바꾸지 않고 문자열로 유지
+    df["코드"] = (
+        df["코드"]
+        .astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(10)
+    )
 
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col].astype(str).str.replace(
-                        ",", "", regex=False
-                    ),
-                    errors="coerce",
-                ).fillna(0)
+    # '계_'로 시작하는 인구 열만 선택
+    total_cols = [
+        col for col in df.columns
+        if col.startswith("계_")
+    ]
 
-    return df, ages
+    # 계_65세부터 계_100세 이상까지 선택
+    elderly_cols = [
+        col for col in total_cols
+        if (
+            (match := re.fullmatch(r"계_(\d+)세", col))
+            and int(match.group(1)) >= 65
+        ) or col == "계_100세 이상"
+    ]
+
+    if not total_cols:
+        raise ValueError("'계_'로 시작하는 인구 열이 없습니다.")
+
+    if not elderly_cols:
+        raise ValueError("65세 이상 인구 열을 찾을 수 없습니다.")
+
+    # 숫자가 아닌 값은 0으로 처리
+    for col in total_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # 동 코드 앞 5자리로 시군구 코드 생성
+    df["시군구코드"] = df["코드"].str[:5]
+
+    # 읍면동 자료를 시군구별로 합산
+    df["전체인구"] = df[total_cols].sum(axis=1)
+    df["65세이상인구"] = df[elderly_cols].sum(axis=1)
+
+    stats = (
+        df.groupby("시군구코드", as_index=False)
+        .agg(
+            전체인구=("전체인구", "sum"),
+            **{"65세이상인구": ("65세이상인구", "sum")},
+        )
+    )
+
+    stats["고령화율"] = (
+        stats["65세이상인구"]
+        .div(stats["전체인구"].replace(0, pd.NA))
+        .mul(100)
+    )
+
+    # GeoJSON 다운로드
+    geo_response = requests.get(GEOJSON_URL, timeout=60)
+    geo_response.raise_for_status()
+    geojson = geo_response.json()
+
+    if geojson.get("type") != "FeatureCollection":
+        raise ValueError("GeoJSON 형식이 FeatureCollection이 아닙니다.")
+
+    # 경계 파일의 코드도 문자열로 통일
+    features = geojson.get("features", [])
+    valid_features = []
+
+    for feature in features:
+        properties = feature.get("properties", {})
+        code = properties.get("코드")
+
+        if code is None:
+            continue
+
+        code = str(code).strip()
+
+        # 숫자 코드가 12345.0 형태로 들어온 경우 정리
+        code = re.sub(r"\.0$", "", code)
+
+        if not code.isdigit():
+            continue
+
+        code = code.zfill(5)
+
+        properties["코드"] = code
+        feature["properties"] = properties
+        valid_features.append(feature)
+
+    geojson["features"] = valid_features
+
+    # 이름이 아닌 시군구 코드로 정확하게 결합
+    geo_codes = {
+        feature["properties"]["코드"]
+        for feature in valid_features
+    }
+
+    stats = stats[stats["시군구코드"].isin(geo_codes)].copy()
+
+    # GeoJSON에 없는 코드는 지도에 표시하지 않음
+    if stats.empty:
+        raise ValueError(
+            "인구 데이터와 경계 GeoJSON의 코드가 일치하지 않습니다. "
+            "두 데이터의 코드 형식을 확인해 주세요."
+        )
+
+    return stats, geojson
 
 
+# --------------------------------------------------
+# 지도 그리기
+# --------------------------------------------------
 try:
-    df, age_labels = load_data()
-except Exception as e:
-    st.error("인구 데이터를 불러오지 못했습니다.")
+    stats, geojson = load_data()
+
+    # 상단 지표
+    total_population = int(stats["전체인구"].sum())
+    elderly_population = int(stats["65세이상인구"].sum())
+
+    nationwide_rate = (
+        elderly_population / total_population * 100
+        if total_population > 0 else 0
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("지도에 포함된 시군구", f"{len(stats):,}곳")
+    col2.metric("지도 기준 전체 인구", f"{total_population:,}명")
+    col3.metric("지도 기준 고령화율", f"{nationwide_rate:.2f}%")
+
     st.info(
-        "인터넷 연결과 CSV 주소를 확인해 주세요. "
-        "데이터의 열 이름이 안내된 형식인지도 확인해 주세요."
+        "고령화율은 전체 인구 중 65세 이상 인구가 차지하는 비율입니다. "
+        "지도에 포함된 시군구의 인구를 합산해 전국 지표를 계산합니다."
     )
+
+    # 색상 값이 없는 지역을 숨기지 않고 별도 처리
+    map_df = stats.dropna(subset=["고령화율"]).copy()
+
+    fig = go.Figure(
+        go.Choropleth(
+            geojson=geojson,
+            featureidkey="properties.코드",
+            locations=map_df["시군구코드"].astype(str),
+            z=map_df["고령화율"],
+            customdata=map_df[["전체인구", "65세이상인구"]].to_numpy(),
+            colorscale=[
+                [0.0, "#fff7bc"],
+                [0.2, "#fec44f"],
+                [0.4, "#fe9929"],
+                [0.6, "#ec7014"],
+                [0.8, "#cc4c02"],
+                [1.0, "#7f2704"],
+            ],
+            marker_line_color="#ffffff",
+            marker_line_width=0.35,
+            colorbar={
+                "title": "고령화율 (%)",
+                "ticksuffix": "%",
+            },
+            zmin=0,
+            zmax=max(30, float(map_df["고령화율"].max())),
+            hovertemplate=(
+                "시군구 코드: %{location}<br>"
+                "고령화율: %{z:.2f}%<br>"
+                "전체 인구: %{customdata[0]:,.0f}명<br>"
+                "65세 이상: %{customdata[1]:,.0f}명"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_geos(
+        visible=False,
+        showcountries=False,
+        showcoastlines=False,
+        showland=False,
+        showframe=False,
+        fitbounds="locations",
+    )
+
+    fig.update_layout(
+        title={
+            "text": "시군구별 65세 이상 인구 비율",
+            "x": 0.5,
+            "xanchor": "center",
+        },
+        height=780,
+        margin={"l": 0, "r": 0, "t": 60, "b": 0},
+        paper_bgcolor="white",
+        geo_bgcolor="white",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 시군구별 수치 표
+    st.subheader("📊 시군구별 고령화율")
+
+    display_df = stats.copy()
+    display_df["고령화율(%)"] = display_df["고령화율"].round(2)
+    display_df = display_df.sort_values(
+        "고령화율(%)", ascending=False
+    )
+
+    # GeoJSON의 시군구 이름을 코드로 연결해 표시
+    name_by_code = {
+        feature["properties"]["코드"]: feature["properties"].get(
+            "시군구", "이름 없음"
+        )
+        for feature in geojson["features"]
+    }
+
+    display_df["시군구"] = display_df["시군구코드"].map(name_by_code)
+    display_df = display_df[
+        [
+            "시군구코드",
+            "시군구",
+            "전체인구",
+            "65세이상인구",
+            "고령화율(%)",
+        ]
+    ]
+
+    display_df = display_df.rename(
+        columns={
+            "시군구코드": "코드",
+            "전체인구": "전체 인구",
+            "65세이상인구": "65세 이상 인구",
+        }
+    )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "시군구별 결과 CSV 다운로드",
+        data=csv_data,
+        file_name="전국_고령화율_2026.csv",
+        mime="text/csv",
+    )
+
+    st.caption(
+        "자료: 제공된 2026년 인구 데이터 및 시군구 경계 GeoJSON. "
+        "코드가 일치하는 시군구만 지도와 표에 표시합니다."
+    )
+
+except Exception as e:
+    st.error("데이터를 불러오거나 지도를 만드는 중 오류가 발생했습니다.")
     st.exception(e)
-    st.stop()
-
-
-# --------------------------------------------------
-# 3. 가장 최신 연도의 데이터만 선택
-# --------------------------------------------------
-latest_year = int(df["연도"].max())
-latest_df = df[df["연도"] == latest_year].copy()
-
-st.title("🏡 동네별 인구 피라미드")
-
-st.markdown(
-    f"우리 동네의 연령별 인구 구조를 살펴보세요. "
-    f"현재 데이터 기준 최신 연도는 **{latest_year}년**입니다."
-)
-
-st.caption(
-    "왼쪽은 남자 인구, 오른쪽은 여자 인구입니다. "
-    "막대가 길수록 해당 연령의 인구가 많습니다."
-)
-
-
-# --------------------------------------------------
-# 4. 시도 → 시군구 → 동 선택
-# --------------------------------------------------
-st.subheader("📍 우리 동네 선택")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    sido_list = sorted(latest_df["시도"].unique().tolist())
-    selected_sido = st.selectbox(
-        "① 시도",
-        sido_list,
-        key="sido",
-    )
-
-# 선택한 시도에 해당하는 시군구만 표시
-sigungu_df = latest_df[
-    latest_df["시도"] == selected_sido
-]
-
-with col2:
-    sigungu_list = sorted(
-        sigungu_df["시군구"].unique().tolist()
-    )
-    selected_sigungu = st.selectbox(
-        "② 시군구",
-        sigungu_list,
-        key="sigungu",
-    )
-
-# 선택한 시도와 시군구에 해당하는 동만 표시
-dong_df = sigungu_df[
-    sigungu_df["시군구"] == selected_sigungu
-]
-
-with col3:
-    dong_list = sorted(
-        dong_df["동"].unique().tolist()
-    )
-    selected_dong = st.selectbox(
-        "③ 동",
-        dong_list,
-        key="dong",
-    )
-
-
-# --------------------------------------------------
-# 5. 선택한 동네의 인구 데이터 계산
-# --------------------------------------------------
-selected_df = latest_df[
-    (latest_df["시도"] == selected_sido)
-    & (latest_df["시군구"] == selected_sigungu)
-    & (latest_df["동"] == selected_dong)
-]
-
-if selected_df.empty:
-    st.warning("선택한 지역의 인구 데이터가 없습니다.")
-    st.stop()
-
-male_columns = [f"남_{age}" for age in age_labels]
-female_columns = [f"여_{age}" for age in age_labels]
-
-# 필요한 인구 열이 모두 존재하는지 확인
-missing_columns = [
-    col
-    for col in male_columns + female_columns
-    if col not in selected_df.columns
-]
-
-if missing_columns:
-    st.error(
-        "데이터에서 필요한 인구 열을 찾을 수 없습니다: "
-        + ", ".join(missing_columns[:10])
-    )
-    st.stop()
-
-# 같은 지역이 여러 행이면 나이별 인구를 합산
-male_population = (
-    selected_df[male_columns]
-    .sum(axis=0)
-    .to_numpy(dtype=float)
-)
-
-female_population = (
-    selected_df[female_columns]
-    .sum(axis=0)
-    .to_numpy(dtype=float)
-)
-
-# 남녀 합계 인구를 나이별로 계산
-total_by_age = male_population + female_population
-
-total_male = int(male_population.sum())
-total_female = int(female_population.sum())
-total_population = total_male + total_female
-
-
-# --------------------------------------------------
-# 6. 평균연령과 고령화율 계산
-# --------------------------------------------------
-
-# 평균연령 계산
-# 100세 이상은 계산 편의를 위해 100세로 간주
-age_numbers = np.arange(101, dtype=float)
-
-average_age = (
-    float(np.dot(total_by_age, age_numbers) / total_population)
-    if total_population > 0
-    else 0.0
-)
-
-# 65세 이상 인구와 고령화율
-elderly_population = float(total_by_age[65:].sum())
-
-aging_rate = (
-    elderly_population / total_population * 100
-    if total_population > 0
-    else 0.0
-)
-
-# 아이 인구는 0~14세로 계산
-children_population = float(total_by_age[:15].sum())
-
-children_rate = (
-    children_population / total_population * 100
-    if total_population > 0
-    else 0.0
-)
-
-elderly_rate = aging_rate
-
-
-# --------------------------------------------------
-# 7. 지표 카드 3개
-# --------------------------------------------------
-st.subheader(
-    f"📊 {selected_sido} {selected_sigungu} {selected_dong}"
-)
-
-card1, card2, card3 = st.columns(3)
-
-with card1:
-    st.metric(
-        "👥 총인구",
-        f"{total_population:,}명",
-    )
-
-with card2:
-    st.metric(
-        "🎂 평균연령",
-        f"{average_age:.1f}세",
-    )
-
-with card3:
-    st.metric(
-        "🌳 고령화율",
-        f"{aging_rate:.1f}%",
-    )
-
-    # 고령화율이 20%를 초과하면 주의 표시
-    if aging_rate > 20:
-        st.warning("⚠️ 고령화율 20% 초과")
-
-
-# --------------------------------------------------
-# 8. 인구 피라미드 그리기
-# --------------------------------------------------
-
-# 나이를 0~100의 숫자 위치로 사용합니다.
-# 이렇게 하면 나이 순서를 숫자로 정확히 고정할 수 있습니다.
-y_positions = list(range(101))
-
-# 남자는 음수로 바꿔 왼쪽에 표시
-male_left = -male_population
-
-fig = go.Figure()
-
-# 남자 인구 막대
-fig.add_trace(
-    go.Bar(
-        y=y_positions,
-        x=male_left,
-        name="남자",
-        orientation="h",
-        marker_color="#7198C8",
-        customdata=np.column_stack(
-            [
-                male_population,
-                np.array(age_labels, dtype=object),
-            ]
-        ),
-        hovertemplate=(
-            "나이: %{customdata[1]}<br>"
-            "남자 인구: %{customdata[0]:,.0f}명"
-            "<extra></extra>"
-        ),
-    )
-)
-
-# 여자 인구 막대
-fig.add_trace(
-    go.Bar(
-        y=y_positions,
-        x=female_population,
-        name="여자",
-        orientation="h",
-        marker_color="#E89A91",
-        customdata=np.column_stack(
-            [
-                female_population,
-                np.array(age_labels, dtype=object),
-            ]
-        ),
-        hovertemplate=(
-            "나이: %{customdata[1]}<br>"
-            "여자 인구: %{customdata[0]:,.0f}명"
-            "<extra></extra>"
-        ),
-    )
-)
-
-# 남녀 좌우 축의 크기를 같게 설정
-max_population = max(
-    float(male_population.max()),
-    float(female_population.max()),
-    1.0,
-)
-
-axis_limit = max_population * 1.12
-
-# 가로축 눈금 계산
-tick_step = max(
-    1,
-    int(np.ceil(axis_limit / 5)),
-)
-
-tick_end = (
-    int(np.ceil(axis_limit / tick_step))
-    * tick_step
-)
-
-positive_ticks = list(
-    range(0, tick_end + 1, tick_step)
-)
-
-tick_values = (
-    [-v for v in positive_ticks[:0:-1]]
-    + positive_ticks
-)
-
-# 남자 인구는 음수여도 눈금에는 양수로 표시
-tick_text = [
-    f"{abs(v):,}"
-    for v in tick_values
-]
-
-fig.update_layout(
-    title={
-        "text": (
-            f"{selected_dong} 연령별 인구 피라미드 "
-            f"({latest_year}년)"
-        ),
-        "x": 0.5,
-        "xanchor": "center",
-    },
-    barmode="overlay",
-    bargap=0.12,
-    height=1000,
-    paper_bgcolor="#FFF9F2",
-    plot_bgcolor="#FFF9F2",
-    font={
-        "family": (
-            "Malgun Gothic, Apple SD Gothic Neo, sans-serif"
-        ),
-        "color": "#5D4638",
-        "size": 12,
-    },
-    legend={
-        "title": "성별",
-        "orientation": "h",
-        "y": 1.02,
-        "x": 0.5,
-        "xanchor": "center",
-    },
-    xaxis={
-        "title": "인구 수 (명)",
-        "range": [-axis_limit, axis_limit],
-        "tickmode": "array",
-        "tickvals": tick_values,
-        "ticktext": tick_text,
-        "zeroline": True,
-        "zerolinewidth": 2,
-        "zerolinecolor": "#BCA38E",
-        "gridcolor": "#EADFD4",
-    },
-    yaxis={
-        "title": "나이",
-        # 0~100 숫자 위치를 그대로 사용합니다.
-        # 범위를 뒤집지 않아 0세가 아래, 100세 이상이 위에 옵니다.
-        "tickmode": "array",
-        "tickvals": y_positions,
-        "ticktext": age_labels,
-        "range": [-0.5, 100.5],
-        "dtick": 5,
-        "gridcolor": "#EADFD4",
-    },
-    margin={
-        "l": 100,
-        "r": 40,
-        "t": 100,
-        "b": 70,
-    },
-)
-
-# 그래프 표시
-st.plotly_chart(fig, use_container_width=True)
-
-
-# --------------------------------------------------
-# 9. 동네 특징 자동 설명
-# --------------------------------------------------
-st.subheader("🔎 이 동네의 인구 특징")
-
-if children_rate > elderly_rate:
-    summary = (
-        f"이 동네는 0~14세 인구 비율({children_rate:.1f}%)이 "
-        f"65세 이상 인구 비율({elderly_rate:.1f}%)보다 높아, "
-        "상대적으로 아이 인구의 비중이 큰 편입니다."
-    )
-
-elif children_rate < elderly_rate:
-    summary = (
-        f"이 동네는 65세 이상 인구 비율({elderly_rate:.1f}%)이 "
-        f"0~14세 인구 비율({children_rate:.1f}%)보다 높아, "
-        "상대적으로 어르신 인구의 비중이 큰 편입니다."
-    )
-
-else:
-    summary = (
-        f"이 동네는 0~14세와 65세 이상 인구 비율이 "
-        f"모두 {children_rate:.1f}%로 같습니다."
-    )
-
-st.info("💬 " + summary)
-
-
-# --------------------------------------------------
-# 10. 그래프 읽는 방법
-# --------------------------------------------------
-with st.expander("💡 인구 피라미드 읽는 방법"):
-    st.markdown(
-        """
-        - **왼쪽 파란색:** 남자 인구
-        - **오른쪽 분홍색:** 여자 인구
-        - **막대가 길수록:** 해당 나이의 인구가 많음
-        - **세로축 아래:** 0세
-        - **세로축 위:** 100세 이상
-        - **평균연령:** 나이별 인구를 고려해 계산한 평균 나이
-        - **고령화율:** 전체 인구 중 65세 이상 인구의 비율
-
-        참고:
-        - 평균연령 계산에서 '100세 이상'은 100세로 간주합니다.
-        - 아이와 어르신 비교는 0~14세와 65세 이상 인구 비율을 기준으로 합니다.
-        """
-    )
-
-st.caption(
-    f"데이터 출처: [GitHub CSV 원본]({DATA_URL}) "
-    f"· 기준 연도: {latest_year}년"
-)
